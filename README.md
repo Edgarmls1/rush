@@ -1,6 +1,6 @@
 # Rush - a rust based terminal
 
-A simple terminal based vim/neovim like text editor
+A simple terminal writen in rust
 
 ## Dependencies
 - rust
