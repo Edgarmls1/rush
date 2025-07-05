@@ -44,7 +44,14 @@ impl Terminal {
 
             match readline {
                 Ok(line) => {
-                    let input = line.trim();
+                    let mut input = line.trim().to_string();
+                    
+                    if let Some(first_command) = input.split_whitespace().next() {
+                        if let Some(replacement) = self.aliases.get(first_command) {
+                            let rest = input[first_command.len()..].trim();
+                            input = format!("{replacement} {rest}");
+                        }
+                    }
 
                     if input.is_empty() {
                         continue;
@@ -169,29 +176,31 @@ impl Terminal {
     }
 
     fn run_command(&self, cmd: &str, args: &[&str]) -> bool {
-    if cmd.is_empty() {
-        return true;
-    }
+        if cmd.is_empty() {
+            return true;
+        }
 
-    match Command::new(cmd).args(args).spawn() {
-        Ok(mut child) => {
-            match child.wait() {
-                Ok(status) => status.success(),
-                Err(_) => false,
+        match Command::new(cmd).args(args).spawn() {
+            Ok(mut child) => {
+                match child.wait() {
+                    Ok(status) => status.success(),
+                    Err(_) => false,
+                }
+            }
+            Err(_) => {
+                eprintln!("X: '{}'", cmd);
+                false
             }
         }
-        Err(_) => {
-            eprintln!("X: '{}'", cmd);
-            false
-        }
     }
-}
 
     fn load_rushrc(&mut self) -> io::Result<()> {
         if let Some(mut path) = dirs::home_dir() {
             path.push(".rushrc");
-
-            if path.exists() {
+            
+            if !path.exists() {
+                return Ok(());
+            } else {
                 let content = fs::read_to_string(path)?;
 
                 for line in content.lines() {
@@ -201,15 +210,13 @@ impl Terminal {
                     }
 
                     if line.starts_with("alias ") {
-                        let parts: Vec<&str> = line[6..].splitn(2, "=").collect();
-                        if parts.len() == 2 {
-                            let name = parts[0].trim().to_string();
-                            let value = parts[1].trim().trim_matches('"').to_string();
-
-                            self.aliases.insert(name, value);
+                        if let Some((name, command)) = line[6..].split_once("=") {
+                            let alias = name.trim();
+                            let value = command.trim().trim_matches('"');
+                            self.aliases.insert(alias.to_string(), value.to_string());
                         }
                     } else if line.starts_with("export ") {
-                        let parts: Vec<&str> = line[7..].splitn(2, '=').collect();
+                        let parts: Vec<&str> = line[7..].splitn(2, "=").collect();
                         if parts.len() == 2 {
                             let key = parts[0].trim().to_string();
                             let value = parts[1].trim().trim_matches('"').to_string();
