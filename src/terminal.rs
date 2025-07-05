@@ -1,6 +1,6 @@
 use std::env;
-use std::io::{self, Write};
-use std::process::{Command, Stdio};
+use std::io;
+use std::process::Command;
 use std::path::{Path, PathBuf};
 use colored::*;
 use dirs;
@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::time::SystemTime;
 use chrono::DateTime;
 use chrono::Local;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::cmp::max;
 use terminal_size::{terminal_size, Width};
 use rustyline::error::ReadlineError;
@@ -18,19 +18,27 @@ use rustyline::DefaultEditor;
 
 pub struct Terminal {
     rl: DefaultEditor,
+    aliases: HashMap<String, String>,
 }
 
 impl Terminal {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut rl = DefaultEditor::new()?;
-        if rl.load_history("history.txt").is_err() {
+        let rl = DefaultEditor::new()?;
+
+        let mut terminal = Self {
+            rl,
+            aliases: HashMap::new(),
+        };
+
+        if let Err(e) = terminal.load_rushrc() {
+            eprintln!("X error loading .rushrc {e}");
         }
 
-        Ok(Self { rl })
+        Ok(terminal)
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
+        'main_loop: loop {
             let prompt = self.print_prompt();
             let readline = self.rl.readline(&prompt);
 
@@ -45,53 +53,81 @@ impl Terminal {
                     if !self.rl.history().iter().any(|h| *h == line) {
                         self.rl.add_history_entry(&line)?;
                     }
+                    
+                    let commands_chained = line.split("&&");
+                    let mut last_command_success = true;
 
-                    let parts: Vec<&str> = input.split_whitespace().collect();
-                    let command = parts[0];
-                    let args = &parts[1..];
+                    for command_str in commands_chained {
+                        if !last_command_success {
+                            break;
+                        }
+                    
+                        let command_str = command_str.trim();
+                        if command_str.is_empty() {
+                            continue;
+                        }
+                    
+                        let parts: Vec<&str> = command_str.split_whitespace().collect();
+
+                        let expanded_parts_str: Vec<String> = self.expand_aliases(&parts);
+
+                        let expanded_parts: Vec<&str> = expanded_parts_str.iter().map(|s| s.as_str()).collect();
+
+                        let _command = expanded_parts[0];
+                        let _args = &expanded_parts[1..];
+                    
+                        let parts: Vec<&str> = input.split_whitespace().collect();
+                        let command = parts[0];
+                        let args = &parts[1..];
                 
-                    match command {
-                        "exit" => break,
-                        "pwd" => {
-                            match env::current_dir() {
-                                Ok(path) => println!("{}", path.display()),
-                                Err(e) => eprintln!("X {e}"),
-                            }
-                        },
-                        "cd" => {
-                            let user = whoami::username().replace('"', "");
-
-                            let target_dir = if !args.is_empty() {
-                                if args[0].starts_with("~") {
-                                    args[0].replacen("~", &format!("/home/{}", user), 1).to_string()
-                                } else {
-                                    args[0].to_string()
+                        match command {
+                            "exit" => break 'main_loop,
+                            "pwd" => {
+                                match env::current_dir() {
+                                    Ok(path) => println!("{}", path.display()),
+                                    Err(e) => eprintln!("X {e}"),
                                 }
-                            } else {
-                                dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string())
-                            };
+                                last_command_success = true;
+                            },
+                            "cd" => {
+                                let user = whoami::username().replace('"', "");
 
-                            if let Err(e) = env::set_current_dir(&target_dir) {
-                                eprintln!("X: {:?}: {e}", target_dir);
-                            }
-                        },
-                        "ls" => {
-                            let path = if !args.is_empty() && !args[0].starts_with('-') {
-                                args[0]
-                            } else {
-                                "."
-                            };
+                                let target_dir = if !args.is_empty() {
+                                    if args[0].starts_with("~") {
+                                        args[0].replacen("~", &format!("/home/{}", user), 1).to_string()
+                                    } else {
+                                        args[0].to_string()
+                                    }
+                                } else {
+                                    dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string())
+                                };
 
-                            let flags: Vec<&str> = args.iter()
-                                .filter(|&&arg| arg.starts_with('-')) 
-                                .copied() 
-                                .collect();
-                            
-                            if let Err(e) = self.colored_ls(path, &flags) {
-                                eprintln!("X: {e}");
+                                if let Err(e) = env::set_current_dir(&target_dir) {
+                                    eprintln!("X: {:?}: {e}", target_dir);
+                                }
+                                last_command_success = env::set_current_dir(&target_dir).is_ok();
+                            },
+                            "ls" => {
+                                let path = if !args.is_empty() && !args[0].starts_with('-') {
+                                    args[0]
+                                } else {
+                                    "."
+                                };
+
+                                let flags: Vec<&str> = args.iter()
+                                    .filter(|&&arg| arg.starts_with('-')) 
+                                    .copied() 
+                                    .collect();
+                                
+                                if let Err(e) = self.colored_ls(path, &flags) {
+                                    eprintln!("X: {e}");
+                                }
+                                last_command_success = true;
+                            },
+                            _ => {
+                                last_command_success = self.run_command(command, args);
                             }
-                        },
-                        _ => self.run_command(command, args),
+                        }
                     }
                 },
                 Err(ReadlineError::Interrupted) => {
@@ -132,29 +168,78 @@ impl Terminal {
         )
     }
 
-    fn run_command(&self, cmd: &str, args: &[&str]) {
-        if cmd.is_empty() {
-            return;
-        }
-
-        match Command::new(cmd)
-            .args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(mut child) => {
-                if let Err(e) = child.wait() {
-                    eprintln!("X: falha ao esperar pelo processo filho: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("X: command not found: '{cmd}': {e}");
-            }
-        }
+    fn run_command(&self, cmd: &str, args: &[&str]) -> bool {
+    if cmd.is_empty() {
+        return true;
     }
 
+    match Command::new(cmd).args(args).spawn() {
+        Ok(mut child) => {
+            match child.wait() {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            }
+        }
+        Err(_) => {
+            eprintln!("X: '{}'", cmd);
+            false
+        }
+    }
+}
+
+    fn load_rushrc(&mut self) -> io::Result<()> {
+        if let Some(mut path) = dirs::home_dir() {
+            path.push(".rushrc");
+
+            if path.exists() {
+                let content = fs::read_to_string(path)?;
+
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.starts_with("#") || line.is_empty() {
+                        continue;
+                    }
+
+                    if line.starts_with("alias ") {
+                        let parts: Vec<&str> = line[6..].splitn(2, "=").collect();
+                        if parts.len() == 2 {
+                            let name = parts[0].trim().to_string();
+                            let value = parts[1].trim().trim_matches('"').to_string();
+
+                            self.aliases.insert(name, value);
+                        }
+                    } else if line.starts_with("export ") {
+                        let parts: Vec<&str> = line[7..].splitn(2, '=').collect();
+                        if parts.len() == 2 {
+                            let key = parts[0].trim().to_string();
+                            let value = parts[1].trim().trim_matches('"').to_string();
+
+                            unsafe {
+                                env::set_var(key, value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expand_aliases(&self, parts: &[&str]) -> Vec<String> {
+        if parts.is_empty() {
+            return vec![];
+        }
+
+        let command = parts[0];
+        if let Some(alias_value) = self.aliases.get(command) {
+            let mut expanded: Vec<String> = alias_value.split_whitespace().map(String::from).collect();
+            expanded.extend(parts[1..].iter().map(|s| s.to_string()));
+            expanded
+        } else {
+            parts.iter().map(|s| s.to_string()).collect()
+        }
+    }
 
     fn colored_ls(&self, path: &str, args: &[&str]) -> std::io::Result<()> {
         let dir = Path::new(path);
@@ -399,12 +484,12 @@ impl Terminal {
 }
 
 fn truncate_string(s: &str, max_width: usize) -> String {
-        if s.chars().count() <= max_width {
-            s.to_string()
-        } else if max_width > 1 {
-            let truncated: String = s.chars().take(max_width - 1).collect();
-            format!("{}…", truncated)
-        } else {
-            "…".to_string()
-        }
+    if s.chars().count() <= max_width {
+        s.to_string()
+    } else if max_width > 1 {
+        let truncated: String = s.chars().take(max_width - 1).collect();
+        format!("{}…", truncated)
+    } else {
+        "…".to_string()
     }
+}
