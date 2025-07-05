@@ -13,74 +13,106 @@ use chrono::Local;
 use std::collections::BTreeMap;
 use std::cmp::max;
 use terminal_size::{terminal_size, Width};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
-pub struct Terminal;
+pub struct Terminal {
+    rl: DefaultEditor,
+}
 
 impl Terminal {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self)
+        let mut rl = DefaultEditor::new()?;
+        if rl.load_history("history.txt").is_err() {
+        }
+
+        Ok(Self { rl })
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            self.print_prompt();
-            io::stdout().flush().unwrap();
+            let prompt = self.print_prompt();
+            let readline = self.rl.readline(&prompt);
 
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_err() {
-                println!("X error");
-                continue;
-            }
+            match readline {
+                Ok(line) => {
+                    let input = line.trim();
 
-            let input = input.trim();
-            let parts: Vec<&str> = input.trim().split_whitespace().collect();
-            
-            match parts[0] {
-                "exit" => break Ok(()),
-                "pwd" => {
-                    match env::current_dir() {
-                        Ok(path) => println!("{}", path.display()),
-                        Err(e) => println!("X {e}"),
+                    if input.is_empty() {
+                        continue;
                     }
-                    continue;
-                },
-                "cd" => {
-                    let target_dir = if parts.len() > 1 {
-                        parts[1].to_string()
-                    } else {
-                        dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string())
-                    };
 
-                    if let Err(e) = env::set_current_dir(&target_dir) {
-                        println!("X: {:?}: {e}", target_dir);
+                    if !self.rl.history().iter().any(|h| *h == line) {
+                        self.rl.add_history_entry(&line)?;
                     }
-                    continue;
-                },
-                "ls" => {
-                    let path = if parts.len() > 1 && !parts[1].starts_with('-') {
-                        parts[1]
-                    } else {
-                        "."
-                    };
-                    
-                    let flags: Vec<&str> = parts.iter()
-                        .skip(1)
-                        .filter(|&arg| arg.starts_with('-'))
-                        .map(|&arg| arg)
-                        .collect();
-                    
-                    if let Err(e) = self.colored_ls(path, &flags) {
-                        println!("X: {e}");
+
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    let command = parts[0];
+                    let args = &parts[1..];
+                
+                    match command {
+                        "exit" => break,
+                        "pwd" => {
+                            match env::current_dir() {
+                                Ok(path) => println!("{}", path.display()),
+                                Err(e) => eprintln!("X {e}"),
+                            }
+                        },
+                        "cd" => {
+                            let user = whoami::username().replace('"', "");
+
+                            let target_dir = if !args.is_empty() {
+                                if args[0].starts_with("~") {
+                                    args[0].replacen("~", &format!("/home/{}", user), 1).to_string()
+                                } else {
+                                    args[0].to_string()
+                                }
+                            } else {
+                                dirs::home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| ".".to_string())
+                            };
+
+                            if let Err(e) = env::set_current_dir(&target_dir) {
+                                eprintln!("X: {:?}: {e}", target_dir);
+                            }
+                        },
+                        "ls" => {
+                            let path = if !args.is_empty() && !args[0].starts_with('-') {
+                                args[0]
+                            } else {
+                                "."
+                            };
+
+                            let flags: Vec<&str> = args.iter()
+                                .filter(|&&arg| arg.starts_with('-')) 
+                                .copied() 
+                                .collect();
+                            
+                            if let Err(e) = self.colored_ls(path, &flags) {
+                                eprintln!("X: {e}");
+                            }
+                        },
+                        _ => self.run_command(command, args),
                     }
-                    continue;
                 },
-                "" => (),
-                _ => self.run_command(input),
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    break;
+                },
+                Err(ReadlineError::Eof) => {
+                    break;
+                },
+                Err(err) => {
+                    eprintln!("Error: {:?}", err);
+                    break;
+                }
             }
         }
+
+        self.rl.save_history("history.txt")?;
+        Ok(())
     }
 
-    fn print_prompt(&self) {
+    fn print_prompt(&self) -> String {
         let user = whoami::username().replace('"', "");
         let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let host = whoami::hostname();
@@ -92,38 +124,37 @@ impl Terminal {
             current_dir.display().to_string()
         };
          
-        print!("\n{}\n{}@{} {} ",
+        format!("\n{}\n{}@{} {} ",
             display_path.bold(),
             user,
             host, 
             ">".green()
-        );
+        )
     }
 
-    fn run_command(&self, command_line: &str) {
-        let parts: Vec<&str> = command_line.split_whitespace().collect();
-
-        if parts.is_empty() {
+    fn run_command(&self, cmd: &str, args: &[&str]) {
+        if cmd.is_empty() {
             return;
         }
-
-        let (cmd, args) = parts.split_first().unwrap();
 
         match Command::new(cmd)
             .args(args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .spawn() 
+            .spawn()
         {
             Ok(mut child) => {
-                let _ = child.wait();
+                if let Err(e) = child.wait() {
+                    eprintln!("X: falha ao esperar pelo processo filho: {e}");
+                }
             }
             Err(e) => {
-                println!("X error {e}");
+                eprintln!("X: command not found: '{cmd}': {e}");
             }
         }
     }
+
 
     fn colored_ls(&self, path: &str, args: &[&str]) -> std::io::Result<()> {
         let dir = Path::new(path);
