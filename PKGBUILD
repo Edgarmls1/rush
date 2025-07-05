@@ -17,5 +17,5 @@ build() {
 
 package() {
     cd "rush-main"
-    sudo install -Dm755 "target/release/reedit" "/usr/bin/"
+    sudo install -Dm755 "target/release/rush" "/usr/bin/"
 }
